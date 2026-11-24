@@ -1,0 +1,12 @@
+{
+  "name": "opencode-session-manager",
+  "version": "0.1.0",
+  "description": "OpenCode server plugin for isolated project sessions",
+  "type": "module",
+  "scripts": { "test": "node test.js" },
+  "exports": "./index.js",
+  "files": ["index.js", "README.md", "LICENSE"],
+  "engines": { "node": ">=20" },
+  "license": "MIT",
+  "dependencies": { "@opencode/plugin": "2.4.1" }
+}
