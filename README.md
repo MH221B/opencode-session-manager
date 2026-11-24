@@ -2,8 +2,8 @@
 
 Server plugin targeting OpenCode 2.4.1. It exposes `session_manager` tools
 `list`, `attach`, `start`, `prompt`, `wait`, `context`, `permission`, and
-`interrupt`. Project sessions are owned by the creating managing session; the
-managing session gets bounded results, not transcripts.
+`interrupt`, plus the read-only history tools `read`, `search`, and `info`.
+Project sessions are owned by the creating managing session.
 
 Install dependencies with `npm install`. In a test workspace's `opencode.json`,
 set `plugins` to an array containing the absolute path of this package directory.
@@ -59,10 +59,44 @@ re-checks entries that were pending when the server stopped.
 | `context` | Current state, pending permission, and bounded last answer for a managed session. |
 | `permission` | Answer a request: `once`, `always`, or `reject`. Returns `stale` if it is no longer pending. |
 | `interrupt` | Stop a managed session. Refuses and lists descendants instead of leaving them running. |
+| `read` | Read text messages from any accessible session by `sessionID`; `limit` selects the newest 1-100 text-bearing messages, default 50. |
+| `search` | Search text with a nonempty `query` (maximum 256 characters), optional `sessionID`, `caseSensitive` and result `limit` (1–100, default 20). |
+| `info` | Read available metadata for any accessible `sessionID`. |
 
 Because results arrive as messages, `wait` is a courtesy for the cases where the
 managing agent wants the answer in its next turn. Long or unattended work should
 not depend on it.
+
+## History access
+
+`read`, `search`, and `info` do not check ownership. They can expose history
+from other managers' sessions if the server permits access. Transcripts can
+contain secrets; no redaction is promised. `read` and `search` include only
+user/assistant text parts, not reasoning or tool data. Existing `context` and
+`wait` remain owner-scoped.
+
+History results use JSON. `read` returns `messages`, `truncated`, and
+`messagesOmitted`; `info` returns session metadata and `truncated`. Search
+returns `matches`, `sessionsScanned`, `truncated`, `incomplete`, and `reason`.
+`truncated` reports clipped returned text or metadata, or an omitted matching
+result. `messagesOmitted` means older text messages were not selected. `incomplete`
+means search may have missed matches; its first reason is `session_limit`,
+`message_limit`, `text_limit`, `timeout`, or `cancelled`.
+
+Returned history text has one aggregate `maxOutput` character budget per call;
+metadata strings are capped at 256 characters. Search visits at most the first
+50 recent sessions and the newest 100 messages per session, scanning at most
+100,000 characters per text part and 1,000,000 total. Matching is literal,
+case-insensitive by default, with overlapping counts and up to 50 characters
+of context on either side. There are no date or cross-scope filters.
+
+The server's `context` call has no verified server-side message limit here:
+one response can be larger than the client-side scan caps. Search has a
+five-second deadline and stops scheduling calls on timeout or cancellation,
+but an already-started server call may continue after the result returns.
+
+History browsing was inspired by Jacob's MIT-licensed
+[opencode-session-manager](https://github.com/jacobjmc/opencode-session-manager).
 
 ## Plugin options
 

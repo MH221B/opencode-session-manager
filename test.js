@@ -131,3 +131,112 @@ assert.equal((await run("context", { sessionID: "ses_existing" })).output, null)
 await assert.rejects(() => run("attach", { sessionID: "ses_existing" }, call("ses_other")), /another session/)
 assert.ok(Array.isArray((await run("list", {})).sessions))
 console.log("PASS: ownership, concurrency, pending guard, timeout, cap, permission, cancellation")
+
+// History tools deliberately read unowned sessions but must never mutate them.
+const history = new Map()
+const historyTools = {}
+const mutations = []
+let listing = { data: [], cursor: {} }
+let contextCalls = []
+let hanging = false
+const historyCtx = {
+  ...ctx,
+  options: { maxOutput: 100 },
+  storage: {
+    get: async () => undefined,
+    set: async () => { mutations.push("storage.set") },
+    scan: async () => ({ entries: [] }),
+  },
+  tool: { transform: async (fn) => fn({ add: (tool) => { historyTools[tool.name] = tool } }) },
+  permission: { ...ctx.permission, reply: async () => { mutations.push("permission.reply") } },
+  session: {
+    ...ctx.session,
+    create: async () => { mutations.push("create") },
+    prompt: async () => { mutations.push("prompt") },
+    interrupt: async () => { mutations.push("interrupt") },
+    get: async ({ sessionID }) => {
+      if (!history.has(sessionID)) throw new Error("not found")
+      return { id: sessionID, title: "History", location: { directory: "/other" }, time: { updated: 123 }, parentID: "parent" }
+    },
+    list: async () => listing,
+    context: async ({ sessionID }) => {
+      contextCalls.push(sessionID)
+      if (hanging) return new Promise(() => {})
+      if (!history.has(sessionID)) throw new Error("not found")
+      return history.get(sessionID)
+    },
+  },
+}
+await plugin.setup(historyCtx)
+const hrun = async (name, input, context = call()) =>
+  JSON.parse((await historyTools[name].execute(input, context)).content)
+const message = (id, text, type = "user") => ({ id, type, content: [{ type: "text", text }] })
+history.set("foreign", [message("old", "old"), message("new", "Banana banana"), {
+  id: "ignored", type: "assistant", content: [{ type: "reasoning", text: "banana" }, { type: "tool", text: "banana" }],
+}])
+assert.deepEqual(await hrun("info", { sessionID: "foreign" }), {
+  sessionID: "foreign", title: "History", directory: "/other", updated: 123, parentID: "parent", truncated: false,
+})
+assert.deepEqual(await hrun("read", { sessionID: "foreign", limit: 2 }), {
+  sessionID: "foreign", messages: [{ id: "old", type: "user", text: "old" }, { id: "new", type: "user", text: "Banana banana" }], truncated: false, messagesOmitted: false,
+})
+assert.equal((await hrun("search", { sessionID: "foreign", query: "ana" })).matches[0].matchCount, 4)
+assert.equal((await hrun("search", { sessionID: "foreign", query: "BANANA", caseSensitive: true })).matches.length, 0)
+assert.equal((await hrun("search", { sessionID: "foreign", query: "absent" })).matches.length, 0)
+await assert.rejects(() => hrun("search", { query: "" }), /Query/)
+for (const name of ["read", "info", "search"]) {
+  await assert.rejects(() => hrun(name, { sessionID: "missing", ...(name === "search" ? { query: "x" } : {}) }), /not found/)
+}
+history.set("empty", [])
+assert.deepEqual((await hrun("read", { sessionID: "empty" })).messages, [])
+const savedGet = historyCtx.session.get
+historyCtx.session.get = async ({ sessionID }) => ({ id: sessionID, title: "t".repeat(300) })
+const clippedInfo = await hrun("info", { sessionID: "foreign" })
+assert.equal(clippedInfo.title.length, 256)
+assert.equal(clippedInfo.truncated, true)
+historyCtx.session.get = savedGet
+history.set("long", [message("1", "x".repeat(80)), message("2", "y".repeat(80))])
+const readLong = await hrun("read", { sessionID: "long" })
+assert.equal(readLong.messages.map((m) => m.text).join("").length, 100)
+assert.equal(readLong.truncated, true)
+history.set("matches", [message("1", "a".repeat(60) + "needle" + "b".repeat(60)), message("2", "needle")])
+const capped = await hrun("search", { sessionID: "matches", query: "needle", limit: 1 })
+assert.equal(capped.matches.length, 1)
+assert.equal(capped.matches[0].excerpt.length, 100)
+assert.equal(capped.truncated, true)
+history.set("many", Array.from({ length: 101 }, (_, i) => message(String(i), "none")))
+const many = await hrun("search", { sessionID: "many", query: "none", limit: 100 })
+assert.equal(many.reason, "message_limit")
+assert.equal(many.matches.length, 25) // Aggregate 100-character text budget.
+listing = { data: Array.from({ length: 50 }, (_, i) => ({ id: `s${i}` })), cursor: { next: "next" } }
+for (const item of listing.data) history.set(item.id, [])
+const pageSearch = await hrun("search", { query: "x" })
+assert.equal(pageSearch.sessionsScanned, 50)
+assert.equal(pageSearch.reason, "session_limit")
+listing = { data: [{ id: "foreign" }, { id: "empty" }], cursor: {} }
+const ordered = await hrun("search", { query: "banana" })
+assert.deepEqual(ordered.matches.map((m) => m.sessionID), ["foreign"])
+history.set("partcap", [message("1", "x".repeat(100000) + "needle")])
+const partcap = await hrun("search", { sessionID: "partcap", query: "needle" })
+assert.equal(partcap.reason, "text_limit")
+assert.equal(partcap.matches.length, 0)
+history.set("totalcap", Array.from({ length: 11 }, (_, i) => message(String(i), "x".repeat(100000))))
+assert.equal((await hrun("search", { sessionID: "totalcap", query: "z" })).reason, "text_limit")
+const controller2 = new AbortController()
+hanging = true
+contextCalls = []
+const aborted = hrun("search", { sessionID: "foreign", query: "x" }, call("ses_owner", controller2.signal))
+await new Promise((resolve) => setImmediate(resolve))
+controller2.abort()
+assert.equal((await aborted).reason, "cancelled")
+assert.equal(contextCalls.length, 1)
+const timedOut = await hrun("search", { sessionID: "foreign", query: "x" })
+assert.equal(timedOut.reason, "timeout")
+hanging = false
+const savedContext = historyCtx.session.context
+historyCtx.session.context = async () => { throw new Error("SDK failure") }
+await assert.rejects(() => hrun("search", { query: "x" }), /SDK failure/)
+historyCtx.session.context = savedContext
+assert.deepEqual(mutations, [])
+assert.deepEqual(historyTools.search.options, { namespace: "session_manager", codemode: true })
+console.log("PASS: read-only history tools, search caps, cancellation and timeout")

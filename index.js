@@ -9,6 +9,8 @@ const properties = {
   decision: { type: "string", enum: ["once", "always", "reject"] },
   limit: { type: "integer", minimum: 1, maximum: 100 },
   cursor: { type: "string", minLength: 1 },
+  query: { type: "string", minLength: 1, maxLength: 256 },
+  caseSensitive: { type: "boolean" },
 }
 
 export default Plugin.define({
@@ -268,12 +270,150 @@ export default Plugin.define({
         locks.delete(id)
       }
     }
+    // History access intentionally does not check ownership. Only text parts are exposed.
+    const historyInfo = (session) => ({
+      sessionID: session.id,
+      title: session.title ?? null,
+      directory: session.location?.directory ?? null,
+      updated: session.time?.updated ?? null,
+      parentID: session.parentID ?? null,
+    })
+    const clipMetadata = (value, state) => {
+      if (typeof value !== "string" || value.length <= 256) return value
+      state.truncated = true
+      return value.slice(0, 256)
+    }
+    const textParts = (message) => (["user", "assistant"].includes(message.type) && Array.isArray(message.content) ? message.content : [])
+      .filter((part) => part.type === "text" && typeof part.text === "string")
+    const historyRead = async (input) => {
+      await ctx.session.get({ sessionID: input.sessionID })
+      const messages = await ctx.session.context({ sessionID: input.sessionID })
+      const textMessages = messages.filter((message) => textParts(message).length > 0)
+      const selected = textMessages.slice(-(input.limit ?? 50))
+      const state = { truncated: false }
+      let remaining = limit
+      const output = []
+      for (const message of selected) {
+        const text = textParts(message).map((part) => part.text).join("")
+        if (!text) continue
+        if (!remaining) { state.truncated = true; break }
+        const clipped = text.slice(0, remaining)
+        if (clipped.length < text.length) state.truncated = true
+        remaining -= clipped.length
+        output.push({ id: clipMetadata(message.id ?? null, state), type: clipMetadata(message.type ?? null, state), text: clipped })
+      }
+      return { sessionID: clipMetadata(input.sessionID, state), messages: output, truncated: state.truncated, messagesOmitted: textMessages.length > selected.length }
+    }
+    const historySearch = async (input, call) => {
+      if (typeof input.query !== "string" || !input.query.length || input.query.length > 256) throw new Error("Query must contain 1 to 256 characters")
+      const response = { matches: [], sessionsScanned: 0, truncated: false, incomplete: false, reason: null }
+      const mark = (reason) => { if (!response.incomplete) { response.incomplete = true; response.reason = reason } }
+      const deadline = Date.now() + 5000
+      const termination = () => call.signal.aborted ? "cancelled" : Date.now() >= deadline ? "timeout" : null
+      const check = () => { const reason = termination(); if (reason) mark(reason); return !!reason }
+      let timer
+      let abort
+      const stopped = new Promise((resolve) => {
+        timer = setTimeout(() => resolve("timeout"), 5000)
+        abort = () => resolve("cancelled")
+        if (call.signal.aborted) abort()
+        else call.signal.addEventListener("abort", abort, { once: true })
+      })
+      const retrieve = async (operation) => {
+        if (check()) return null
+        const value = await Promise.race([operation().then((data) => ({ data })), stopped.then((reason) => ({ reason }))])
+        if (value.reason) { mark(value.reason); return null }
+        if (check()) return null
+        return value.data
+      }
+      const yieldNow = () => new Promise((resolve) => setTimeout(resolve, 0))
+      let textRemaining = limit
+      let scanRemaining = 1000000
+      let ended = false
+      try {
+        let ids
+        if (input.sessionID) {
+          const session = await retrieve(() => ctx.session.get({ sessionID: input.sessionID }))
+          if (session === null) return response
+          ids = [input.sessionID]
+        } else {
+          const page = await retrieve(() => ctx.session.list({ limit: 50, order: "desc" }))
+          if (page === null) return response
+          ids = page.data.slice(0, 50).map((session) => session.id)
+          if (page.cursor?.next || page.data.length > 50) mark("session_limit")
+        }
+        const needle = input.caseSensitive ? input.query : input.query.toLowerCase()
+        for (const id of ids) {
+          if (check() || ended) break
+          const messages = await retrieve(() => ctx.session.context({ sessionID: id }))
+          if (messages === null) break
+          response.sessionsScanned++
+          if (messages.length > 100) mark("message_limit")
+          for (const message of messages.slice(-100)) {
+            if (check() || ended) break
+            for (const part of textParts(message)) {
+              if (check() || ended) break
+              const length = Math.min(part.text.length, 100000, scanRemaining)
+              if (length < part.text.length) mark("text_limit")
+              const original = part.text.slice(0, length)
+              scanRemaining -= length
+              const text = input.caseSensitive ? original : original.toLowerCase()
+              let first = -1
+              let count = 0
+              let offset = 0
+              while (offset <= text.length - needle.length) {
+                const end = Math.min(text.length - needle.length + 1, offset + 4096)
+                for (; offset < end; offset++) {
+                  if (text.startsWith(needle, offset)) { if (first < 0) first = offset; count++ }
+                }
+                await yieldNow()
+                if (check()) { ended = true; break }
+              }
+              if (first >= 0) {
+                if (response.matches.length >= (input.limit ?? 20) || !textRemaining) {
+                  response.truncated = true
+                  ended = true
+                  break
+                }
+                const start = Math.max(0, first - 50)
+                const end = Math.min(original.length, first + input.query.length + 50)
+                const excerpt = original.slice(start, end)
+                const clipped = excerpt.slice(0, textRemaining)
+                if (clipped.length < excerpt.length) response.truncated = true
+                textRemaining -= clipped.length
+                response.matches.push({
+                  sessionID: clipMetadata(id, response), messageID: clipMetadata(message.id ?? null, response),
+                  type: clipMetadata(message.type ?? null, response), excerpt: clipped, matchCount: count,
+                })
+              }
+              if (!scanRemaining && length < part.text.length) ended = true
+            }
+          }
+        }
+        return response
+      } finally {
+        clearTimeout(timer)
+        call.signal.removeEventListener("abort", abort)
+      }
+    }
     const definitions = {
       list: {
         required: [],
         async run(input) {
           const page = await ctx.session.list(input.cursor ? { cursor: input.cursor } : { limit: input.limit ?? 20, order: "desc" })
           return { sessions: page.data.map((s) => ({ sessionID: s.id, title: s.title ?? null, directory: s.location?.directory ?? null, updated: s.time?.updated ?? null, parentID: s.parentID ?? null })), next: page.cursor?.next ?? null }
+        },
+      },
+      read: { required: ["sessionID"], run: historyRead },
+      search: { required: ["query"], run: historySearch },
+      info: {
+        required: ["sessionID"],
+        async run(input) {
+          const session = await ctx.session.get({ sessionID: input.sessionID })
+          const state = { truncated: false }
+          const info = historyInfo(session)
+          for (const field of Object.keys(info)) info[field] = clipMetadata(info[field], state)
+          return { ...info, truncated: state.truncated }
         },
       },
       attach: {
@@ -402,12 +542,15 @@ export default Plugin.define({
       context: "Report current state, pending permission and bounded answer for a managed project session.",
       permission: "Answer a permission request raised by a managed project session: once, always, or reject.",
       interrupt: "Stop a managed project session that has no descendants.",
+      read: "Read bounded text history from an accessible session, including one not owned by this manager.",
+      search: "Search bounded text history in an accessible session or recent sessions.",
+      info: "Read metadata for an accessible session.",
     }
     await ctx.tool.transform((editor) => {
       for (const [name, definition] of Object.entries(definitions)) {
         editor.add({
           name, description: descriptions[name] ?? `Manage an owned project session: ${name}`,
-          input: { type: "object", properties: Object.fromEntries(definition.required.concat(name === "wait" ? ["timeout"] : name === "list" ? ["limit", "cursor"] : []).map((field) => [field, properties[field]])), required: definition.required, additionalProperties: false },
+          input: { type: "object", properties: Object.fromEntries(definition.required.concat(name === "wait" ? ["timeout"] : name === "list" ? ["limit", "cursor"] : name === "read" ? ["limit"] : name === "search" ? ["sessionID", "caseSensitive", "limit"] : []).map((field) => [field, properties[field]])), required: definition.required, additionalProperties: false },
           options: { namespace: "session_manager", codemode: true },
           execute: async (input, call) => result(await definition.run(input, call)),
         })
