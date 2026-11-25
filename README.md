@@ -1,7 +1,7 @@
 # OpenCode session manager
 
 Server plugin targeting OpenCode 2.4.1. It exposes `session_manager` tools
-`list`, `attach`, `start`, `prompt`, `wait`, `context`, `permission`, and
+`list`, `attach`, `start`, `prompt`, `wait`, `context`, `permission`, `answer`, and
 `interrupt`, plus the read-only history tools `read`, `search`, and `info`.
 Project sessions are owned by the creating managing session.
 
@@ -58,6 +58,7 @@ re-checks entries that were pending when the server stopped.
 | `wait` | Convenience join. Reports state after `timeout` (default 5000 ms, max 3600000). Returns `completed`/`failed`/`interrupted`/`running`/`cancelled`/`permission_required`, plus bounded output marked partial unless completed. Does not interrupt. |
 | `context` | Current state, pending permission, and bounded last answer for a managed session. |
 | `permission` | Answer a request: `once`, `always`, or `reject`. Returns `stale` if it is no longer pending. |
+| `answer` | Reply to a managed root or descendant's question with `sessionID`, `formID`, and an `answer` object keyed by field key. Returns `stale` when already answered or cancelled. |
 | `interrupt` | Stop a managed session. Refuses and lists descendants instead of leaving them running. |
 | `read` | Read text messages from any accessible session by `sessionID`; `limit` selects the newest 1-100 text-bearing messages, default 50. |
 | `search` | Search text with a nonempty `query` (maximum 256 characters), optional `sessionID`, `caseSensitive` and result `limit` (1–100, default 20). |
@@ -66,6 +67,20 @@ re-checks entries that were pending when the server stopped.
 Because results arrive as messages, `wait` is a courtesy for the cases where the
 managing agent wants the answer in its next turn. Long or unattended work should
 not depend on it.
+
+Questions from a managed root or descendant arrive as queued synthetic messages
+containing the origin `sessionID`, `formID`, title and complete fields. `context`
+and `wait` also return `question_required` while a form is pending. The server
+validates the answer values. Pending forms are checked again on plugin startup;
+delivery markers suppress repeat notices after restart. If the process stops
+between queueing a notice and saving its marker, a duplicate notice is possible.
+
+Question relay requires a registered managed local service. The plugin discovers
+the service without starting one and checks that its server PID is the plugin's
+own process before using its form API. Standalone, embedded and remote hosts
+without that registration are unsupported: question-aware tool calls report an
+explicit error. Form requests use the origin session's location, including when
+it differs from the manager's directory. Permission replies use that location too.
 
 ## History access
 
@@ -112,22 +127,10 @@ instruction line. The managing agent relays that to the operator: map `allow` to
 `once`, `always` to `always`, and `deny` to `reject`, then call `permission`.
 A stale request cannot be replayed.
 
-## Known limitation: permission replies are location-scoped
-
-`permission.asked` events are server-wide, so this plugin can surface a request
-raised by a project session in any directory. `ctx.permission.reply` is not: it
-answers against the plugin's own location, so replying to a request raised in
-another directory fails with "Permission request not found". The client exposes
-no location override (`RequestOptions` is `{ signal, headers, onActivity }`).
-
-Consequences:
-
-- Propagation works everywhere: `wait` and `context` return `permission_required`
-  with the request ID, action, resources and an instruction line.
-- Answering works only for sessions in the plugin's own location.
-- Run project sessions with allow-all permissions (or matching
-  `allowPermissions` rules) so requests do not arise in unattended use, or answer
-  them in the session's own client.
+Permission replies use the requesting session's directory, including for
+descendants in other locations. They require the authenticated local service
+to be discoverable and to run in the same server process. If the service or
+session location is unavailable, the reply fails rather than using another location.
 
 ## Distribution
 

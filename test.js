@@ -1,28 +1,68 @@
 import assert from "node:assert/strict"
-import plugin from "./index.js"
+import { createPlugin } from "./index.js"
 
 const storage = new Map()
 const sessions = new Map()
+sessions.set("ses_owner", [])
 const tools = {}
 let sequence = 0
 let permission = []
 let replied = 0
 let interrupted = true
 let idle = false
+let forms = []
+const notices = []
+let noticeSequence = 0
+let syntheticGate
+const formCalls = []
+const permissionCalls = []
+const subscribers = []
+const fakeClient = {
+  permission: { reply: async (input, options) => {
+    permissionCalls.push({ input, options })
+    replied++
+    permission = permission.filter((p) => p.sessionID !== input.sessionID || p.id !== input.requestID)
+  } },
+  session: { inbox: { list: async ({ sessionID }) => notices.filter((item) => item.sessionID === sessionID), cancel: async ({ sessionID, inboxID }) => {
+    const index = notices.findIndex((item) => item.id === inboxID && item.sessionID === sessionID)
+    if (index >= 0) notices.splice(index, 1)
+  } }, form: {
+    list: async ({ sessionID }, options) => {
+      formCalls.push({ sessionID, options })
+      return forms.filter((form) => form.sessionID === sessionID)
+    },
+    reply: async ({ sessionID, formID, answer }, options) => {
+      formCalls.push({ sessionID, formID, answer, options })
+      forms = forms.filter((form) => form.sessionID !== sessionID || form.id !== formID)
+    },
+  } },
+}
+const plugin = createPlugin(async () => fakeClient)
+assert.equal(fakeClient.session.permission, undefined, "permission API must exist only at the client root")
+const emit = (event) => { for (const subscriber of subscribers) subscriber(event) }
 const ctx = {
+  location: { directory: "D:\\owner" },
   options: { maxOutput: 4 },
   storage: {
     get: async (key) => storage.get(key),
     set: async (key, value) => storage.set(key, structuredClone(value)),
+    scan: async () => ({ entries: [] }),
   },
   tool: { transform: async (fn) => fn({ add: (tool) => { tools[tool.name] = tool } }) },
-  event: { subscribe: async function* () {} },
+  event: { subscribe: async function* ({ types, signal }) {
+    const queue = []
+    let wake
+    const receive = (event) => { if (types.includes(event.type)) { queue.push(event); wake?.() } }
+    subscribers.push(receive)
+    signal.addEventListener("abort", () => wake?.(), { once: true })
+    while (!signal.aborted) {
+      if (!queue.length) await new Promise((resolve) => { wake = resolve })
+      while (queue.length) yield queue.shift()
+    }
+  } },
   permission: {
     list: async ({ sessionID }) => permission.filter((p) => p.sessionID === sessionID),
-    reply: async ({ sessionID, requestID }) => {
-      replied++
-      permission = permission.filter((p) => p.sessionID !== sessionID || p.id !== requestID)
-    },
+    reply: async () => { throw new Error("location-bound permission reply must not be used") },
   },
   session: {
     hook: async () => ({ dispose: async () => {} }),
@@ -35,13 +75,14 @@ const ctx = {
     context: async ({ sessionID }) => sessions.get(sessionID),
     get: async ({ sessionID }) => {
       if (!sessions.has(sessionID)) throw new Error("not found")
-      return { id: sessionID, parentID: sessionID === "ses_child" ? "ses_1" : undefined }
+      return { id: sessionID, location: { directory: sessionID === "ses_child" ? "D:\\other project" : "D:\\project" }, parentID: sessionID === "ses_child" ? "ses_1" : undefined }
     },
     list: async ({ parentID }) => ({
       data: parentID === "ses_1" && sessions.has("ses_child") ? [{ id: "ses_child", parentID }] : [],
       cursor: {},
     }),
     prompt: async () => {},
+    synthetic: async (input) => { if (syntheticGate) await syntheticGate; const item = { ...input, id: `notice_${++noticeSequence}` }; notices.push(item); return item },
     wait: async (_, { signal }) => new Promise((resolve, reject) => {
       if (idle) resolve()
       else if (signal.aborted) reject(signal.reason)
@@ -50,7 +91,7 @@ const ctx = {
     interrupt: async () => ({ interrupted }),
   },
 }
-await plugin.setup(ctx)
+const dispose = await plugin.setup(ctx)
 const call = (sessionID = "ses_owner", signal = new AbortController().signal) => ({
   sessionID, signal, progress: async () => {},
 })
@@ -77,6 +118,7 @@ assert.equal(requested.requestID, "p1")
 assert.equal(replied, 0)
 assert.equal((await run("permission", { sessionID: a.sessionID, requestID: "p1", decision: "reject" })).status, "replied")
 assert.equal(replied, 1)
+assert.equal(permissionCalls.at(-1).options.headers["x-opencode-directory"], encodeURIComponent("D:\\project"))
 assert.equal((await run("permission", { sessionID: a.sessionID, requestID: "p1", decision: "once" })).status, "stale")
 permission = []
 const originalSetInterval = globalThis.setInterval
@@ -121,7 +163,62 @@ assert.equal(childRequest.sessionID, "ses_child")
 assert.equal(childRequest.message, "approval")
 await assert.rejects(() => run("context", { sessionID: "ses_child" }), /descendant of ses_1/)
 await assert.rejects(() => run("interrupt", { sessionID: a.sessionID }), /descendants exist/)
+await assert.rejects(() => run("permission", { sessionID: "ses_child", requestID: "p2", decision: "once" }, call("ses_other")), /unowned/)
 assert.equal((await run("permission", { sessionID: "ses_child", requestID: "p2", decision: "once" })).status, "replied")
+assert.deepEqual(permissionCalls.at(-1), {
+  input: { sessionID: "ses_child", requestID: "p2", decision: "once" },
+  options: { headers: { "x-opencode-directory": encodeURIComponent("D:\\other project") } },
+})
+assert.equal((await run("permission", { sessionID: "ses_child", requestID: "p2", decision: "once" })).status, "stale")
+permission = [{ id: "race-permission", sessionID: "ses_child", action: "shell", resources: ["test"] }]
+const normalReply = fakeClient.permission.reply
+fakeClient.permission.reply = async () => { permission = []; throw new Error("already answered") }
+assert.equal((await run("permission", { sessionID: "ses_child", requestID: "race-permission", decision: "once" })).status, "stale")
+permission = [{ id: "failed-permission", sessionID: "ses_child", action: "shell", resources: ["test"] }]
+fakeClient.permission.reply = async () => { throw new Error("service unavailable") }
+await assert.rejects(() => run("permission", { sessionID: "ses_child", requestID: "failed-permission", decision: "once" }), /service unavailable/)
+fakeClient.permission.reply = normalReply
+permission = [{ id: "auto", sessionID: "ses_child", action: "shell", resources: ["test"] }]
+const autoTools = {}
+const disposeAuto = await plugin.setup({
+  ...ctx,
+  options: { ...ctx.options, allowPermissions: [{ action: "shell", resource: "test" }] },
+  tool: { transform: async (fn) => fn({ add: (tool) => { autoTools[tool.name] = tool } }) },
+})
+await autoTools.context.execute({ sessionID: a.sessionID }, call())
+assert.deepEqual(permissionCalls.at(-1), {
+  input: { sessionID: "ses_child", requestID: "auto", decision: "once" },
+  options: { headers: { "x-opencode-directory": encodeURIComponent("D:\\other project") } },
+})
+disposeAuto()
+forms = [{ id: "form1", sessionID: "ses_child", title: "Choose", fields: [{ key: "choice", type: "string", title: "Choice" }] }]
+const duplicateTools = {}
+const disposeDuplicate = await plugin.setup({
+  ...ctx,
+  location: { directory: "D:\\other project" },
+  tool: { transform: async (fn) => fn({ add: (tool) => { duplicateTools[tool.name] = tool } }) },
+})
+emit({ type: "form.created", data: { form: forms[0] } })
+await new Promise((resolve) => setTimeout(resolve, 20))
+assert.equal(notices.length, 1, "two plugin instances must enqueue only one notice")
+disposeDuplicate()
+assert.equal(notices[0].sessionID, "ses_owner")
+assert.equal(notices[0].delivery, "queue")
+assert.match(notices[0].text, /form1/)
+assert.equal((await run("context", { sessionID: a.sessionID })).formID, "form1")
+assert.equal((await run("wait", { sessionID: a.sessionID })).sessionID, "ses_child")
+await assert.rejects(() => run("answer", { sessionID: "ses_child", formID: "form1", answer: { choice: "yes" } }, call("ses_other")), /unowned/)
+assert.equal((await run("answer", { sessionID: "ses_child", formID: "form1", answer: { choice: "yes" } })).status, "replied")
+assert.equal(notices.length, 0, "answered question must not remain queued")
+assert.equal(formCalls.at(-1).options.headers["x-opencode-directory"], encodeURIComponent("D:\\other project"))
+assert.equal((await run("answer", { sessionID: "ses_child", formID: "form1", answer: { choice: "yes" } })).status, "stale")
+forms = [{ id: "cancelled", sessionID: "ses_child", title: "Cancelled", fields: [{ key: "choice", type: "string" }] }]
+forms = []
+emit({ type: "form.cancelled", data: { id: "cancelled", sessionID: "ses_child" } })
+assert.equal((await run("answer", { sessionID: "ses_child", formID: "cancelled", answer: { choice: "yes" } })).status, "stale")
+emit({ type: "form.created", data: { form: { id: "form1", sessionID: "ses_child" } } })
+await new Promise((resolve) => setTimeout(resolve, 20))
+assert.equal(notices.length, 0)
 sessions.set("ses_existing", [{ id: "old", type: "assistant", content: [{ type: "text", text: "old" }] }])
 await assert.rejects(() => run("attach", { sessionID: "ses_owner" }), /managing session/)
 await assert.rejects(() => run("attach", { sessionID: "ses_existing" }), /running session/)
@@ -130,6 +227,106 @@ assert.equal((await run("attach", { sessionID: "ses_existing" })).status, "attac
 assert.equal((await run("context", { sessionID: "ses_existing" })).output, null)
 await assert.rejects(() => run("attach", { sessionID: "ses_existing" }, call("ses_other")), /another session/)
 assert.ok(Array.isArray((await run("list", {})).sessions))
+forms = [{ id: "restart", sessionID: "ses_child", title: "Again", fields: [{ key: "n", type: "integer", title: "Number" }] }]
+const recoveryNotices = []
+const recoveryTools = {}
+const recoveryCtx = {
+  ...ctx,
+  storage: {
+    ...ctx.storage,
+    scan: async ({ after }) => after ? { entries: [] } : {
+      entries: [{ key: "session/ses_1", value: storage.get("session/ses_1") }],
+    },
+  },
+  tool: { transform: async (fn) => fn({ add: (tool) => { recoveryTools[tool.name] = tool } }) },
+  session: { ...ctx.session, synthetic: async (input) => recoveryNotices.push(input) },
+}
+const disposeRecovery = await plugin.setup(recoveryCtx)
+await new Promise((resolve) => setTimeout(resolve, 20))
+assert.equal(recoveryNotices.length, 1, "restart must relay an outstanding descendant form")
+assert.match(recoveryNotices[0].text, /restart/)
+disposeRecovery()
+const disposeRecoveryAgain = await plugin.setup(recoveryCtx)
+await new Promise((resolve) => setTimeout(resolve, 20))
+assert.equal(recoveryNotices.length, 1, "restart must not relay a delivered form twice")
+disposeRecoveryAgain()
+forms = []
+const idleHooks = []
+const completionNotices = []
+const completionCtx = {
+  ...ctx,
+  tool: { transform: async (fn) => fn({ add: () => {} }) },
+  session: {
+    ...ctx.session,
+    hook: async (_, fn) => { idleHooks.push(fn); return { dispose: async () => {} } },
+    synthetic: async (input) => completionNotices.push(input),
+  },
+}
+const disposeCompletion1 = await plugin.setup(completionCtx)
+const disposeCompletion2 = await plugin.setup({ ...completionCtx, location: { directory: "D:\\other project" } })
+const pendingEntry = storage.get("session/ses_1")
+await ctx.storage.set("session/ses_1", { ...pendingEntry, pending: true, delivered: false, watched: false })
+await Promise.all(idleHooks.map((hook) => hook({ sessionID: "ses_1" })))
+assert.equal(completionNotices.length, 1, "two plugin instances must enqueue only one completion")
+disposeCompletion1()
+disposeCompletion2()
+// A completion queued while the owner is busy is removed only after that owner reads it.
+const scopedHooks = []
+const scopedTools = {}
+const disposeScoped = await plugin.setup({
+  ...ctx,
+  tool: { transform: async (fn) => fn({ add: (tool) => { scopedTools[tool.name] = tool } }) },
+  session: { ...ctx.session, hook: async (_, fn) => { scopedHooks.push(fn) } },
+})
+const scopedRun = async (name, input, context = call()) =>
+  JSON.parse((await scopedTools[name].execute(input, context)).content)
+const scoped = await scopedRun("start", { directory: "new", task: "test" })
+sessions.get(scoped.sessionID).push({ id: "new-answer", type: "assistant", content: [{ type: "text", text: "done" }] })
+notices.push({ id: "unrelated", sessionID: "ses_owner", text: "older unrelated notice" })
+await scopedHooks[0]({ sessionID: scoped.sessionID })
+assert.equal(notices.filter((item) => item.text.includes(`Project ${scoped.sessionID} finished`)).length, 1)
+assert.equal((await scopedRun("context", { sessionID: scoped.sessionID })).output.text, "done")
+assert.deepEqual(notices.map((item) => item.id), ["unrelated"], "only the consumed completion may be cancelled")
+await scopedRun("prompt", { sessionID: scoped.sessionID, task: "again" })
+sessions.get(scoped.sessionID).push({ id: "new-answer-2", type: "assistant", content: [{ type: "text", text: "next" }] })
+assert.equal((await scopedRun("context", { sessionID: scoped.sessionID })).output.text, "next")
+await scopedHooks[0]({ sessionID: scoped.sessionID })
+assert.deepEqual(notices.map((item) => item.id), ["unrelated"], "reading an idle result must suppress a later completion")
+await scopedRun("prompt", { sessionID: scoped.sessionID, task: "question" })
+forms = [{ id: "race-form", sessionID: scoped.sessionID, title: "Race", fields: [{ key: "x", type: "string" }] }]
+let releaseSynthetic
+syntheticGate = new Promise((resolve) => { releaseSynthetic = resolve })
+emit({ type: "form.created", data: { form: forms[0] } })
+await new Promise((resolve) => setTimeout(resolve, 20))
+const readingQuestion = scopedRun("context", { sessionID: scoped.sessionID })
+releaseSynthetic()
+assert.equal((await readingQuestion).formID, "race-form")
+syntheticGate = undefined
+assert.deepEqual(notices.map((item) => item.id), ["unrelated"], "an in-flight enqueue must be cancelled after reading the question")
+await scopedRun("answer", { sessionID: scoped.sessionID, formID: "race-form", answer: { x: "yes" } })
+sessions.get(scoped.sessionID).push({ id: "new-answer-3", type: "assistant", content: [{ type: "text", text: "last" }] })
+const waited = await scopedRun("wait", { sessionID: scoped.sessionID, timeout: 1000 }, {
+  ...call(), progress: async () => scopedHooks[0]({ sessionID: scoped.sessionID }),
+})
+assert.equal(waited.status, "completed")
+assert.deepEqual(notices.map((item) => item.id), ["unrelated"], "wait must cancel its queued completion")
+await scopedRun("prompt", { sessionID: scoped.sessionID, task: "timeout" })
+idle = false
+assert.equal((await scopedRun("wait", { sessionID: scoped.sessionID, timeout: 10 })).status, "running")
+sessions.get(scoped.sessionID).push({ id: "new-answer-4", type: "assistant", content: [{ type: "text", text: "later" }] })
+idle = true
+await scopedHooks[0]({ sessionID: scoped.sessionID })
+assert.equal(notices.filter((item) => item.text.includes(`Project ${scoped.sessionID} finished`)).length, 1, "timed-out wait must not suppress later notification")
+disposeScoped()
+const unsupportedTools = {}
+const disposeUnsupported = await createPlugin(async () => { throw new Error("unsupported host") }).setup({
+  ...ctx,
+  tool: { transform: async (fn) => fn({ add: (tool) => { unsupportedTools[tool.name] = tool } }) },
+})
+await assert.rejects(() => unsupportedTools.context.execute({ sessionID: a.sessionID }, call()), /Question relay unavailable: unsupported host/)
+await assert.rejects(() => unsupportedTools.start.execute({ directory: "a", task: "test" }, call()), /Question relay unavailable: unsupported host/)
+disposeUnsupported()
+dispose()
 console.log("PASS: ownership, concurrency, pending guard, timeout, cap, permission, cancellation")
 
 // History tools deliberately read unowned sessions but must never mutate them.
@@ -167,7 +364,7 @@ const historyCtx = {
     },
   },
 }
-await plugin.setup(historyCtx)
+const disposeHistory = await plugin.setup(historyCtx)
 const hrun = async (name, input, context = call()) =>
   JSON.parse((await historyTools[name].execute(input, context)).content)
 const message = (id, text, type = "user") => ({ id, type, content: [{ type: "text", text }] })
@@ -239,4 +436,5 @@ await assert.rejects(() => hrun("search", { query: "x" }), /SDK failure/)
 historyCtx.session.context = savedContext
 assert.deepEqual(mutations, [])
 assert.deepEqual(historyTools.search.options, { namespace: "session_manager", codemode: true })
+disposeHistory()
 console.log("PASS: read-only history tools, search caps, cancellation and timeout")

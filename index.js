@@ -1,4 +1,33 @@
 import { Plugin } from "@opencode/plugin"
+import { OpenCode } from "@opencode/client"
+import { Service } from "@opencode/client/service"
+
+// ponytail: process-local deduplication assumes one server process; durable cross-process
+// exactly-once delivery requires an atomic inbox idempotency key.
+const formNotices = globalThis[Symbol.for("opencode-session-manager.formNotices")] ??= new Map()
+const deliveryLocks = globalThis[Symbol.for("opencode-session-manager.deliveryLocks")] ??= new Set()
+const noticeLocks = globalThis[Symbol.for("opencode-session-manager.noticeLocks")] ??= new Map()
+
+async function withNoticeLock(id, fn) {
+  const previous = noticeLocks.get(id) ?? Promise.resolve()
+  let release
+  const next = new Promise((resolve) => { release = resolve })
+  noticeLocks.set(id, next)
+  await previous
+  try { return await fn() } finally {
+    release()
+    if (noticeLocks.get(id) === next) noticeLocks.delete(id)
+  }
+}
+
+async function localClient() {
+  const endpoint = await Service.discover()
+  if (!endpoint) throw new Error("Question relay requires the managed local OpenCode service; no service was discovered")
+  const client = OpenCode.make({ baseUrl: endpoint.url, headers: Service.headers(endpoint) })
+  const info = await client.server.info()
+  if (info.pid !== process.pid) throw new Error("Question relay unsupported: discovered OpenCode service is not this server process")
+  return client
+}
 
 const properties = {
   sessionID: { type: "string", minLength: 1 },
@@ -11,9 +40,11 @@ const properties = {
   cursor: { type: "string", minLength: 1 },
   query: { type: "string", minLength: 1, maxLength: 256 },
   caseSensitive: { type: "boolean" },
+  formID: { type: "string", minLength: 1 },
+  answer: { type: "object", additionalProperties: { anyOf: [{ type: "string" }, { type: "number" }, { type: "boolean" }, { type: "array", items: { type: "string" } }] } },
 }
 
-export default Plugin.define({
+export function createPlugin(connect = localClient) { return Plugin.define({
   id: "session-manager",
   async setup(ctx) {
     const limit = Number.isInteger(ctx.options?.maxOutput) && ctx.options.maxOutput > 0
@@ -88,6 +119,96 @@ export default Plugin.define({
       }
       return ids
     }
+    let clientPromise
+    const client = () => clientPromise ??= Promise.resolve().then(connect).catch((error) => {
+      clientPromise = undefined
+      throw new Error(`Question relay unavailable: ${error.message}`)
+    })
+    const formOptions = async (sessionID) => {
+      const session = await ctx.session.get({ sessionID })
+      const directory = session.location?.directory
+      if (!directory) throw new Error(`Question relay unavailable: no location for ${sessionID}`)
+      return { headers: { "x-opencode-directory": encodeURIComponent(directory) } }
+    }
+    const replyPermission = async (input) =>
+      (await client()).permission.reply(input, await formOptions(input.sessionID))
+    const formsFor = async (ids) => {
+      const api = await client()
+      const forms = await Promise.all(ids.map(async (sessionID) =>
+        api.session.form.list({ sessionID }, await formOptions(sessionID))))
+      return forms.flat()
+    }
+    const cancelNotice = async (owner, inboxID) => {
+      if (!inboxID) return true
+      try {
+        const api = await client()
+        const options = await formOptions(owner)
+        const pending = await api.session.inbox.list({ sessionID: owner }, options)
+        if (pending.some((item) => item.id === inboxID)) await api.session.inbox.cancel({ sessionID: owner, inboxID }, options)
+        return true
+      } catch { return false }
+    }
+    const consumeForm = async (form, owner, known = true) => {
+      const marker = `form/${form.id}`
+      const notice = await ctx.storage.get(marker)
+      let cancelled = true
+      if (notice?.owner === owner && notice.sessionID === form.sessionID) cancelled = await cancelNotice(owner, notice.inboxID)
+      else if (!known) return
+      await ctx.storage.set(marker, { owner, sessionID: form.sessionID, consumed: true, ...(!cancelled ? { inboxID: notice.inboxID } : {}) })
+      formNotices.set(form.id, "delivered")
+    }
+    const relayForm = async (form) => {
+      const match = await rootOf(form.sessionID)
+      if (!match) return
+      return withNoticeLock(match.root, async () => {
+      if (formNotices.has(form.id)) return
+      // Claim synchronously before any storage or network operation.
+      formNotices.set(form.id, "pending")
+      try {
+        const marker = `form/${form.id}`
+        if (await ctx.storage.get(marker)) {
+          formNotices.set(form.id, "delivered")
+          return
+        }
+        if (!(await formsFor([form.sessionID])).some((item) => item.id === form.id)) {
+          formNotices.delete(form.id)
+          return
+        }
+        const notice = { status: "question_required", managedSessionID: match.root, sessionID: form.sessionID, formID: form.id, title: form.title, fields: form.fields }
+        const item = await ctx.session.synthetic({
+          sessionID: match.entry.owner, delivery: "queue",
+          text: `A managed session needs an answer. Use session_manager.answer with sessionID, formID and an answer object keyed by field key.\n${JSON.stringify(notice)}`,
+        })
+        formNotices.set(form.id, "delivered")
+        await ctx.storage.set(marker, { owner: match.entry.owner, sessionID: form.sessionID, inboxID: item?.id })
+      } catch (error) {
+        if (formNotices.get(form.id) === "pending") formNotices.delete(form.id)
+        throw error
+      }
+      })
+    }
+    const questionFor = async (ids, relay = true) => {
+      const form = (await formsFor(ids))[0]
+      if (form && relay) void relayForm(form).catch(() => {})
+      return form ? { status: "question_required", sessionID: form.sessionID, formID: form.id, title: form.title, fields: form.fields } : null
+    }
+    let recoveryTimer
+    let recover
+    const scheduleRecovery = () => {
+      if (!stop.signal.aborted && !recoveryTimer) recoveryTimer = setTimeout(() => {
+        recoveryTimer = undefined
+        void recover()
+      }, 5000)
+    }
+    void (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ types: ["form.created", "form.replied", "form.cancelled"], signal: stop.signal })) {
+          if (event.type === "form.created" && event.data?.form) {
+            void relayForm(event.data.form).catch(scheduleRecovery)
+          }
+        }
+      } catch {}
+    })()
     const snapshot = async (id, entry) => {
       const messages = await ctx.session.context({ sessionID: id })
       const answer = [...messages].reverse().find((m) =>
@@ -120,14 +241,13 @@ export default Plugin.define({
           instruction: `Permission requested by ${id}: ${request.action} ${resources.join(", ")}${request.message ? ` (${request.message})` : ""}. Reply allow, always, or deny.`,
           replies: { allow: "once", always: "always", deny: "reject" },
         }
-        await ctx.permission.reply({ sessionID: id, requestID: request.id, decision: "once" })
+        await replyPermission({ sessionID: id, requestID: request.id, decision: "once" })
         asked.delete(request.id)
       }
       return null
     }
     const running = new Map()
     const outcome = new Map()
-    const deliveryLocks = new Set()
     const ttl = 600000
     const blocking = (id) => {
       const snapshot = running.get(id)
@@ -140,17 +260,12 @@ export default Plugin.define({
       if (deliveryLocks.has(match.root)) return
       deliveryLocks.add(match.root)
       try {
+      await withNoticeLock(match.root, async () => {
       match.entry = await ctx.storage.get(key(match.root))
       if (!match.entry?.pending) return
-      if (match.entry.watched) {
-        // A wait call is already collecting this result; suppress the duplicate notice.
-        match.entry.pending = false
-        match.entry.delivered = true
-        await ctx.storage.set(key(match.root), match.entry)
-        return
-      }
-      if (match.entry.delivered) return
       const ids = await descendants(match.root)
+      if (await questionFor(ids)) return
+      if (match.entry.delivered) return
       const signal = new AbortController().signal
       const active = await Promise.all(ids.map((id) => probe(id, signal, 150)))
       const busy = ids.some((id, i) => active[i]) || ids.some((id) => blocking(id))
@@ -168,11 +283,14 @@ export default Plugin.define({
         ...(current.output?.truncated ? ["[Output truncated]"] : []),
       ]
       try {
-        await ctx.session.synthetic({ sessionID: match.entry.owner, text: lines.join("\n"), delivery: "queue" })
+        const item = await ctx.session.synthetic({ sessionID: match.entry.owner, text: lines.join("\n"), delivery: "queue" })
+        match.entry.completionInboxID = item?.id
         match.entry.delivered = true
         match.entry.pending = false
+        match.entry.status = status
         await ctx.storage.set(key(match.root), match.entry)
       } catch {}
+      })
       } finally {
         deliveryLocks.delete(match.root)
       }
@@ -194,10 +312,16 @@ export default Plugin.define({
       running.set(event.sessionID, { items: event.background ?? [], at: Date.now() })
       await idled(event.sessionID)
     })
-    void (async () => {
+    recover = async () => {
       try {
-        const page = await ctx.storage.scan({ prefix: "session/", limit: 200 })
+        let after
+        do {
+        const page = await ctx.storage.scan({ prefix: "session/", limit: 200, ...(after ? { after } : {}) })
         for (const { key: stored, value } of page.entries ?? []) {
+          if (value?.owner) {
+            const id = stored.slice("session/".length)
+            for (const form of await formsFor(await descendants(id))) await relayForm(form)
+          }
           if (value?.pending && !value.delivered && !value.watched) {
             const id = stored.slice("session/".length)
             value.recovered = true
@@ -205,8 +329,13 @@ export default Plugin.define({
             setTimeout(() => { void idled(id).catch(() => {}) }, 1500)
           }
         }
-      } catch {}
-    })()
+        after = page.next
+        } while (after)
+      } catch {
+        scheduleRecovery()
+      }
+    }
+    void recover()
     void (async () => {
       try {
         for await (const event of ctx.event.subscribe({
@@ -250,13 +379,16 @@ export default Plugin.define({
       locks.add(id)
       try {
         const entry = await owned(id, owner)
+        await client()
         if (entry.pending) throw new Error("Session has a pending prompt; wait or interrupt first")
         const messages = await ctx.session.context({ sessionID: id })
         entry.previous = messages.filter((m) => m.type === "assistant").map((m) => m.id)
         entry.delivered = false
+        delete entry.completionInboxID
         outcome.delete(id)
         running.delete(id)
         delete entry.recovered
+        delete entry.status
         entry.pending = true
         await ctx.storage.set(key(id), entry)
         try {
@@ -420,6 +552,7 @@ export default Plugin.define({
         required: ["sessionID"],
         async run(input, call) {
           const id = input.sessionID
+          await client()
           if (id === call.sessionID) throw new Error("Cannot attach the managing session")
           if (locks.has(id)) throw new Error("Session already has an active operation")
           locks.add(id)
@@ -439,6 +572,7 @@ export default Plugin.define({
       start: {
         required: ["directory", "task"],
         async run(input, call) {
+          await client()
           const session = await ctx.session.create({ location: { directory: input.directory } })
           if (!session?.id || session.id === call.sessionID) throw new Error("Invalid created session")
           await ctx.storage.set(key(session.id), { owner: call.sessionID, previous: [], pending: false, delivered: false })
@@ -450,10 +584,57 @@ export default Plugin.define({
       context: {
         required: ["sessionID"],
         async run(input, call) {
+          return withNoticeLock(input.sessionID, async () => {
           const entry = await owned(input.sessionID, call.sessionID)
-          const blocked = await permissions(await descendants(input.sessionID))
+          const ids = await descendants(input.sessionID)
+          const blocked = await questionFor(ids, false) ?? await permissions(ids)
+          if (blocked?.status === "question_required") await consumeForm({ id: blocked.formID, sessionID: blocked.sessionID }, call.sessionID)
           const current = await snapshot(input.sessionID, entry)
+          if (!blocked && entry.pending && current.output) {
+            const active = await Promise.all(ids.map((id) => probe(id, call.signal, 150)))
+            if (!active.some(Boolean) && !ids.some((id) => blocking(id)) && !call.signal.aborted) {
+              entry.pending = false
+              entry.delivered = true
+              entry.status = current.failed ? "failed" : outcome.get(input.sessionID) === "interrupted" ? "interrupted" : outcome.get(input.sessionID) === "failed" ? "failed" : "completed"
+              await ctx.storage.set(key(input.sessionID), entry)
+            }
+          }
+          if (!blocked && !entry.pending && entry.completionInboxID) {
+            if (await cancelNotice(call.sessionID, entry.completionInboxID)) {
+              delete entry.completionInboxID
+              await ctx.storage.set(key(input.sessionID), entry)
+            }
+          }
           return { managedSessionID: input.sessionID, ...(blocked ?? { sessionID: input.sessionID, status: entry.pending ? "pending" : "idle" }), output: current.output }
+          })
+        },
+      },
+      answer: {
+        required: ["sessionID", "formID", "answer"],
+        async run(input, call) {
+          const { root } = await resolveOwned(input.sessionID, call.sessionID)
+          return withNoticeLock(root, async () => {
+          if (!input.answer || typeof input.answer !== "object" || Array.isArray(input.answer)) throw new Error("Answer must be an object keyed by field key")
+          const api = await client()
+          const options = await formOptions(input.sessionID)
+          const pending = await api.session.form.list({ sessionID: input.sessionID }, options)
+          if (!pending.some((form) => form.id === input.formID)) {
+            await consumeForm({ id: input.formID, sessionID: input.sessionID }, call.sessionID, false)
+            return { sessionID: input.sessionID, managedSessionID: root, formID: input.formID, status: "stale" }
+          }
+          try {
+            await api.session.form.reply({ sessionID: input.sessionID, formID: input.formID, answer: input.answer }, options)
+          } catch (error) {
+            const remaining = await api.session.form.list({ sessionID: input.sessionID }, options)
+            if (!remaining.some((form) => form.id === input.formID)) {
+              await consumeForm({ id: input.formID, sessionID: input.sessionID }, call.sessionID, false)
+              return { sessionID: input.sessionID, managedSessionID: root, formID: input.formID, status: "stale" }
+            }
+            throw error
+          }
+          await consumeForm({ id: input.formID, sessionID: input.sessionID }, call.sessionID)
+          return { sessionID: input.sessionID, managedSessionID: root, formID: input.formID, status: "replied" }
+          })
         },
       },
       permission: {
@@ -465,8 +646,7 @@ export default Plugin.define({
           const request = pending.find((item) => item.id === input.requestID)
           if (!request) return { sessionID: input.sessionID, requestID: input.requestID, status: "stale" }
           try {
-            // Events are server-wide but reply is location-scoped: requests from other directories surface and cannot be answered (see README).
-            await ctx.permission.reply({ sessionID: input.sessionID, requestID: input.requestID, decision: input.decision })
+            await replyPermission({ sessionID: input.sessionID, requestID: input.requestID, decision: input.decision })
             asked.delete(input.requestID)
           } catch (error) {
             const remaining = await pendingFor([input.sessionID])
@@ -495,17 +675,39 @@ export default Plugin.define({
       wait: {
         required: ["sessionID"],
         async run(input, call) {
-          const entry = await owned(input.sessionID, call.sessionID)
-          if (!entry.pending) return { sessionID: input.sessionID, status: "idle", output: (await snapshot(input.sessionID, entry)).output }
-          await call.progress({ status: "waiting" })
-          entry.watched = true
-          await ctx.storage.set(key(input.sessionID), entry)
+          let entry
+          const initial = await withNoticeLock(input.sessionID, async () => {
+            entry = await owned(input.sessionID, call.sessionID)
+            const question = await questionFor(await descendants(input.sessionID), false)
+            if (question) {
+              await consumeForm({ id: question.formID, sessionID: question.sessionID }, call.sessionID)
+              return { managedSessionID: input.sessionID, ...question, output: (await snapshot(input.sessionID, entry)).output, partial: true }
+            }
+            if (!entry.pending) {
+              const output = (await snapshot(input.sessionID, entry)).output
+              if (entry.completionInboxID) {
+                if (await cancelNotice(call.sessionID, entry.completionInboxID)) {
+                  delete entry.completionInboxID
+                  await ctx.storage.set(key(input.sessionID), entry)
+                }
+              }
+              return { sessionID: input.sessionID, status: "idle", output }
+            }
+            entry.watched = true
+            await ctx.storage.set(key(input.sessionID), entry)
+          })
+          if (initial) return initial
           const deadline = Date.now() + (input.timeout ?? 5000)
           let state
           try {
+          await call.progress({ status: "waiting" })
           while (Date.now() < deadline && !call.signal.aborted) {
             const ids = await descendants(input.sessionID)
-            const blocked = await permissions(ids)
+            const blocked = await withNoticeLock(input.sessionID, async () => {
+              const question = await questionFor(ids, false)
+              if (question) await consumeForm({ id: question.formID, sessionID: question.sessionID }, call.sessionID)
+              return question ?? await permissions(ids)
+            })
             if (blocked) { state = blocked; break }
             const latest = await owned(input.sessionID, call.sessionID)
             if (!latest.pending) {
@@ -522,13 +724,26 @@ export default Plugin.define({
           if (!state) state = { status: call.signal.aborted ? "cancelled" : "running" }
           const current = await snapshot(input.sessionID, entry)
           const status = state.status === "completed" && current.failed ? "failed" : state.status
+          if (["completed", "failed", "interrupted", "incomplete"].includes(status)) {
+            await withNoticeLock(input.sessionID, async () => {
+              const latest = await ctx.storage.get(key(input.sessionID))
+              if (latest?.owner === call.sessionID && latest.completionInboxID) {
+                if (await cancelNotice(call.sessionID, latest.completionInboxID)) {
+                  delete latest.completionInboxID
+                  await ctx.storage.set(key(input.sessionID), latest)
+                }
+              }
+            })
+          }
           return { managedSessionID: input.sessionID, sessionID: input.sessionID, ...state, status, output: current.output, partial: status !== "completed", ...(current.output ? {} : { outputUnavailable: true }) }
           } finally {
+            await withNoticeLock(input.sessionID, async () => {
             const latest = await ctx.storage.get(key(input.sessionID))
             if (latest?.watched) {
               delete latest.watched
               await ctx.storage.set(key(input.sessionID), latest)
             }
+            })
           }
         },
       },
@@ -541,6 +756,7 @@ export default Plugin.define({
       wait: "Convenience join: reports current state after a few seconds at most. Results also arrive as messages.",
       context: "Report current state, pending permission and bounded answer for a managed project session.",
       permission: "Answer a permission request raised by a managed project session: once, always, or reject.",
+      answer: "Answer a pending question form from an owned project session or descendant using an object keyed by field key.",
       interrupt: "Stop a managed project session that has no descendants.",
       read: "Read bounded text history from an accessible session, including one not owned by this manager.",
       search: "Search bounded text history in an accessible session or recent sessions.",
@@ -556,6 +772,8 @@ export default Plugin.define({
         })
       }
     })
-    return () => stop.abort()
+    return () => { stop.abort(); clearTimeout(recoveryTimer) }
   },
-})
+}) }
+
+export default createPlugin()

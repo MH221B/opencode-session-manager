@@ -8,5 +8,5 @@
   "files": ["index.js", "README.md", "LICENSE"],
   "engines": { "node": ">=20" },
   "license": "MIT",
-  "dependencies": { "@opencode/plugin": "2.4.1" }
+  "dependencies": { "@opencode/client": "2.4.1", "@opencode/plugin": "2.4.1" }
 }
