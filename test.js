@@ -18,7 +18,7 @@ const formCalls = []
 const permissionCalls = []
 const subscribers = []
 const fakeClient = {
-  permission: { reply: async (input, options) => {
+  permission: { list: async ({ sessionID }) => permission.filter((p) => p.sessionID === sessionID), reply: async (input, options) => {
     permissionCalls.push({ input, options })
     replied++
     permission = permission.filter((p) => p.sessionID !== input.sessionID || p.id !== input.requestID)
@@ -46,6 +46,7 @@ const ctx = {
   storage: {
     get: async (key) => storage.get(key),
     set: async (key, value) => storage.set(key, structuredClone(value)),
+    remove: async (key) => storage.delete(key),
     scan: async () => ({ entries: [] }),
   },
   tool: { transform: async (fn) => fn({ add: (tool) => { tools[tool.name] = tool } }) },
@@ -438,3 +439,107 @@ assert.deepEqual(mutations, [])
 assert.deepEqual(historyTools.search.options, { namespace: "session_manager", codemode: true })
 disposeHistory()
 console.log("PASS: read-only history tools, search caps, cancellation and timeout")
+
+// Delete operates only on owned, quiescent trees and never removes the caller.
+const deleteStore = new Map()
+const tree = new Map([["root", null], ["child", "root"], ["owner", null], ["other", null]])
+const deleteTools = {}
+let removals = 0
+let failRemove = false
+let busyID
+let removeGate
+let removeEntered
+const deleteCtx = {
+  ...ctx,
+  storage: {
+    get: async (key) => deleteStore.get(key),
+    set: async (key, value) => deleteStore.set(key, structuredClone(value)),
+    remove: async (key) => deleteStore.delete(key),
+    scan: async ({ prefix }) => ({ entries: [...deleteStore].filter(([key]) => key.startsWith(prefix)).map(([key, value]) => ({ key, value })) }),
+  },
+  tool: { transform: async (fn) => fn({ add: (tool) => { deleteTools[tool.name] = tool } }) },
+  session: {
+    ...ctx.session,
+    get: async ({ sessionID }) => {
+      if (!tree.has(sessionID)) throw new Error("not found")
+      return { id: sessionID, parentID: tree.get(sessionID), location: { directory: "D:\\delete-test" } }
+    },
+    list: async ({ parentID }) => ({ data: [...tree].filter(([, parent]) => parent === parentID).map(([id, parentID]) => ({ id, parentID })), cursor: {} }),
+    wait: async ({ sessionID }, { signal }) => {
+      if (sessionID !== busyID) return
+      return new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }))
+    },
+    remove: async ({ sessionID }) => {
+      removals++
+      removeEntered?.()
+      if (removeGate) await removeGate
+      if (failRemove) throw new Error("uncertain")
+      tree.delete(sessionID)
+      tree.delete("child")
+    },
+  },
+}
+const disposeDelete = await createPlugin(async () => fakeClient).setup(deleteCtx)
+const deleteRun = async (id = "root", owner = "owner") => JSON.parse((await deleteTools.delete.execute({ sessionID: id }, call(owner))).content)
+await deleteCtx.storage.set("session/root", { owner: "owner", pending: false, previous: [] })
+await assert.rejects(() => deleteRun("root", "other"), /unowned/)
+await assert.rejects(() => deleteRun("child"), /descendant/)
+tree.set("owner", "child")
+await assert.rejects(() => deleteRun(), /containing/)
+tree.set("owner", null)
+await deleteCtx.storage.set("session/child", { owner: "other" })
+await assert.rejects(() => deleteRun(), /managed descendant/)
+await deleteCtx.storage.remove("session/child")
+await deleteCtx.storage.set("session/root", { owner: "owner", pending: true, previous: [] })
+await assert.rejects(() => deleteRun(), /pending/)
+await deleteCtx.storage.set("session/root", { owner: "owner", watched: true, previous: [] })
+await assert.rejects(() => deleteRun(), /watched/)
+await deleteCtx.storage.set("session/root", { owner: "owner", pending: false, previous: [] })
+busyID = "child"
+await assert.rejects(() => deleteRun(), /busy/)
+busyID = undefined
+forms = [{ id: "delete-form", sessionID: "child" }]
+await assert.rejects(() => deleteRun(), /forms/)
+forms = []
+permission = [{ id: "delete-permission", sessionID: "child" }]
+await assert.rejects(() => deleteRun(), /permissions/)
+permission = []
+const permissionList = fakeClient.permission.list
+fakeClient.permission.list = async () => { throw new Error("permission check failed") }
+await assert.rejects(() => deleteRun(), /permission check failed/)
+fakeClient.permission.list = permissionList
+assert.equal(removals, 0)
+notices.push({ id: "delete-notice", sessionID: "owner" })
+await deleteCtx.storage.set("form/old-delete-form", { owner: "owner", sessionID: "child", inboxID: "delete-notice" })
+const otherDeleteTools = {}
+const disposeOtherDelete = await createPlugin(async () => fakeClient).setup({
+  ...deleteCtx,
+  tool: { transform: async (fn) => fn({ add: (tool) => { otherDeleteTools[tool.name] = tool } }) },
+})
+let releaseRemove
+removeGate = new Promise((resolve) => { releaseRemove = resolve })
+let enteredRemove
+const removing = new Promise((resolve) => { enteredRemove = resolve })
+removeEntered = enteredRemove
+const deleting = deleteRun()
+await removing
+const concurrentPrompt = otherDeleteTools.prompt.execute({ sessionID: "root", task: "must not run" }, call("owner"))
+releaseRemove()
+assert.equal((await deleting).status, "deleted")
+await assert.rejects(() => concurrentPrompt, /unowned/)
+disposeOtherDelete()
+removeGate = undefined
+removeEntered = undefined
+assert.equal(removals, 1)
+assert.equal(deleteStore.has("session/root"), false)
+assert.equal(deleteStore.has("form/old-delete-form"), false)
+assert.equal(notices.some((item) => item.id === "delete-notice"), false)
+assert.equal(tree.has("owner"), true)
+tree.set("root", null)
+await deleteCtx.storage.set("session/root", { owner: "owner", pending: false, previous: [] })
+failRemove = true
+await assert.rejects(() => deleteRun(), /uncertain/)
+assert.equal(deleteStore.get("session/root").deleting, true)
+await assert.rejects(() => deleteRun(), /reconciliation/)
+disposeDelete()
+console.log("PASS: safe deletion and uncertain removal")

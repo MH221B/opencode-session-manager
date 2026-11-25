@@ -7,18 +7,24 @@ import { Service } from "@opencode/client/service"
 const formNotices = globalThis[Symbol.for("opencode-session-manager.formNotices")] ??= new Map()
 const deliveryLocks = globalThis[Symbol.for("opencode-session-manager.deliveryLocks")] ??= new Set()
 const noticeLocks = globalThis[Symbol.for("opencode-session-manager.noticeLocks")] ??= new Map()
+// ponytail: serialize manager mutations process-wide; use per-tree locks if throughput matters.
+const operationLocks = globalThis[Symbol.for("opencode-session-manager.operationLocks")] ??= new Map()
+const running = globalThis[Symbol.for("opencode-session-manager.running")] ??= new Map()
+const asked = globalThis[Symbol.for("opencode-session-manager.asked")] ??= new Map()
 
-async function withNoticeLock(id, fn) {
-  const previous = noticeLocks.get(id) ?? Promise.resolve()
+async function withLock(locks, id, fn) {
+  const previous = locks.get(id) ?? Promise.resolve()
   let release
   const next = new Promise((resolve) => { release = resolve })
-  noticeLocks.set(id, next)
+  locks.set(id, next)
   await previous
   try { return await fn() } finally {
     release()
-    if (noticeLocks.get(id) === next) noticeLocks.delete(id)
+    if (locks.get(id) === next) locks.delete(id)
   }
 }
+const withNoticeLock = (id, fn) => withLock(noticeLocks, id, fn)
+const withOperationLock = (fn) => withLock(operationLocks, "operations", fn)
 
 async function localClient() {
   const endpoint = await Service.discover()
@@ -53,7 +59,6 @@ export function createPlugin(connect = localClient) { return Plugin.define({
     const locks = new Set()
     // permission.asked arrives with a location of its own, so session-scoped polling misses
     // requests raised by project sessions that live outside this plugin's location.
-    const asked = new Map()
     const stop = new AbortController()
     void (async () => {
       try {
@@ -99,6 +104,7 @@ export function createPlugin(connect = localClient) { return Plugin.define({
     const owned = async (id, owner) => {
       const match = await resolveOwned(id, owner)
       if (match.root !== id) throw new Error(`Session ${id} is a descendant of ${match.root}; use the parent`)
+      if (match.entry.deleting) throw new Error("Session deletion requires reconciliation")
       return match.entry
     }
     const descendants = async (root) => {
@@ -161,6 +167,8 @@ export function createPlugin(connect = localClient) { return Plugin.define({
       const match = await rootOf(form.sessionID)
       if (!match) return
       return withNoticeLock(match.root, async () => {
+      const current = await ctx.storage.get(key(match.root))
+      if (!current?.owner || current.owner !== match.entry.owner || current.deleting) return
       if (formNotices.has(form.id)) return
       // Claim synchronously before any storage or network operation.
       formNotices.set(form.id, "pending")
@@ -246,7 +254,6 @@ export function createPlugin(connect = localClient) { return Plugin.define({
       }
       return null
     }
-    const running = new Map()
     const outcome = new Map()
     const ttl = 600000
     const blocking = (id) => {
@@ -262,7 +269,7 @@ export function createPlugin(connect = localClient) { return Plugin.define({
       try {
       await withNoticeLock(match.root, async () => {
       match.entry = await ctx.storage.get(key(match.root))
-      if (!match.entry?.pending) return
+      if (!match.entry?.pending || match.entry.deleting) return
       const ids = await descendants(match.root)
       if (await questionFor(ids)) return
       if (match.entry.delivered) return
@@ -324,9 +331,13 @@ export function createPlugin(connect = localClient) { return Plugin.define({
           }
           if (value?.pending && !value.delivered && !value.watched) {
             const id = stored.slice("session/".length)
-            value.recovered = true
-            await ctx.storage.set(stored, value)
-            setTimeout(() => { void idled(id).catch(() => {}) }, 1500)
+            await withNoticeLock(id, async () => {
+              const latest = await ctx.storage.get(stored)
+              if (!latest?.pending || latest.delivered || latest.watched || latest.deleting) return
+              latest.recovered = true
+              await ctx.storage.set(stored, latest)
+              setTimeout(() => { void idled(id).catch(() => {}) }, 1500)
+            })
           }
         }
         after = page.next
@@ -672,6 +683,71 @@ export function createPlugin(connect = localClient) { return Plugin.define({
           return { sessionID: input.sessionID, status: "interrupted", interrupted: true }
         },
       },
+      delete: {
+        required: ["sessionID"],
+        async run(input, call) {
+          const id = input.sessionID
+          return withNoticeLock(id, async () => {
+            const entry = await owned(id, call.sessionID)
+            if (entry.deleting) throw new Error("Session deletion requires reconciliation")
+            if (entry.pending || entry.watched) throw new Error("Session has pending or watched work")
+            const ids = await descendants(id)
+            if (ids.includes(call.sessionID)) throw new Error("Cannot delete a tree containing the managing session")
+            for (const child of ids.slice(1)) {
+              if (await ctx.storage.get(key(child))) throw new Error(`Independently managed descendant: ${child}`)
+            }
+            for (const sessionID of ids) {
+              if (blocking(sessionID) || await probe(sessionID, call.signal)) throw new Error(`Session is busy: ${sessionID}`)
+            }
+            if (call.signal.aborted) throw new Error("Deletion cancelled")
+            if ((await formsFor(ids)).length) throw new Error("Session has pending forms")
+            for (const sessionID of ids) {
+              const requests = await (await client()).permission.list({ sessionID }, await formOptions(sessionID))
+              if (!Array.isArray(requests)) throw new Error("Permission check returned no result")
+              if (requests.some((request) => request.sessionID === sessionID) ||
+                  [...asked.values()].some((request) => request.sessionID === sessionID)) {
+                throw new Error("Session has pending permissions")
+              }
+            }
+            const markers = []
+            let after
+            do {
+              const page = await ctx.storage.scan({ prefix: "form/", limit: 200, ...(after ? { after } : {}) })
+              for (const item of page.entries ?? []) {
+                if (item.value?.owner === call.sessionID && ids.includes(item.value.sessionID)) markers.push(item)
+              }
+              after = page.next
+            } while (after)
+            for (const marker of markers) {
+              if (!(await cancelNotice(call.sessionID, marker.value.inboxID))) throw new Error("Could not cancel question notice")
+            }
+            if (!(await cancelNotice(call.sessionID, entry.completionInboxID))) throw new Error("Could not cancel completion notice")
+            if (call.signal.aborted) throw new Error("Deletion cancelled")
+            // Persist before removal: an uncertain result must never restart notifications.
+            await ctx.storage.set(key(id), { ...entry, deleting: true })
+            try {
+              await ctx.session.remove({ sessionID: id })
+            } catch (error) {
+              throw new Error(`Session removal uncertain for ${id}; reconciliation required: ${error.message}`)
+            }
+            try {
+              for (const marker of markers) {
+                await ctx.storage.remove(marker.key)
+                formNotices.delete(marker.key.slice("form/".length))
+              }
+              for (const sessionID of ids) {
+                running.delete(sessionID)
+                outcome.delete(sessionID)
+                for (const [requestID, request] of asked) if (request.sessionID === sessionID) asked.delete(requestID)
+              }
+              await ctx.storage.remove(key(id))
+            } catch (error) {
+              throw new Error(`Session ${id} deleted but plugin cleanup incomplete: ${error.message}`)
+            }
+            return { sessionID: id, status: "deleted" }
+          })
+        },
+      },
       wait: {
         required: ["sessionID"],
         async run(input, call) {
@@ -758,6 +834,7 @@ export function createPlugin(connect = localClient) { return Plugin.define({
       permission: "Answer a permission request raised by a managed project session: once, always, or reject.",
       answer: "Answer a pending question form from an owned project session or descendant using an object keyed by field key.",
       interrupt: "Stop a managed project session that has no descendants.",
+      delete: "Permanently delete an idle owned managed root and its descendants; refuses pending work.",
       read: "Read bounded text history from an accessible session, including one not owned by this manager.",
       search: "Search bounded text history in an accessible session or recent sessions.",
       info: "Read metadata for an accessible session.",
@@ -768,7 +845,9 @@ export function createPlugin(connect = localClient) { return Plugin.define({
           name, description: descriptions[name] ?? `Manage an owned project session: ${name}`,
           input: { type: "object", properties: Object.fromEntries(definition.required.concat(name === "wait" ? ["timeout"] : name === "list" ? ["limit", "cursor"] : name === "read" ? ["limit"] : name === "search" ? ["sessionID", "caseSensitive", "limit"] : []).map((field) => [field, properties[field]])), required: definition.required, additionalProperties: false },
           options: { namespace: "session_manager", codemode: true },
-          execute: async (input, call) => result(await definition.run(input, call)),
+          execute: async (input, call) => result(await (["attach", "start", "prompt", "interrupt", "permission", "answer", "delete"].includes(name)
+            ? withOperationLock(() => definition.run(input, call))
+            : definition.run(input, call))),
         })
       }
     })
