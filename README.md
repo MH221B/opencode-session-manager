@@ -2,7 +2,7 @@
 
 Server plugin targeting OpenCode 2.4.1. It exposes `session_manager` tools
 `list`, `attach`, `start`, `prompt`, `wait`, `context`, `permission`, `answer`, and
-`interrupt`, plus the read-only history tools `read`, `search`, and `info`.
+`interrupt`, and `delete`, plus the read-only history tools `read`, `search`, and `info`.
 Project sessions are owned by the creating managing session.
 
 Install dependencies with `npm install`. In a test workspace's `opencode.json`,
@@ -60,6 +60,7 @@ re-checks entries that were pending when the server stopped.
 | `permission` | Answer a request: `once`, `always`, or `reject`. Returns `stale` if it is no longer pending. |
 | `answer` | Reply to a managed root or descendant's question with `sessionID`, `formID`, and an `answer` object keyed by field key. Returns `stale` when already answered or cancelled. |
 | `interrupt` | Stop a managed session. Refuses and lists descendants instead of leaving them running. |
+| `delete` | Permanently delete an owned managed root and its descendants. Refuses pending, watched, busy or blocked trees, independently managed descendants, and trees containing the caller. |
 | `read` | Read text messages from any accessible session by `sessionID`; `limit` selects the newest 1-100 text-bearing messages, default 50. |
 | `search` | Search text with a nonempty `query` (maximum 256 characters), optional `sessionID`, `caseSensitive` and result `limit` (1–100, default 20). |
 | `info` | Read available metadata for any accessible `sessionID`. |
@@ -131,6 +132,19 @@ Permission replies use the requesting session's directory, including for
 descendants in other locations. They require the authenticated local service
 to be discoverable and to run in the same server process. If the service or
 session location is unavailable, the reply fails rather than using another location.
+
+Deletion requires the local service for form and permission checks. It never
+interrupts work or answers requests. It cancels known queued notices before
+removal, but cannot retract notices already delivered. A removal error leaves a
+durable deletion marker because the outcome may be uncertain; inspect the
+session and reconcile the marker before managing it again. Cleanup errors after
+confirmed removal are reported separately.
+
+Deletion checks and plugin operations are coordinated within one server process.
+Other clients can still change the tree or start work between the checks and
+the server's recursive removal; the server does not expose an atomic guarded
+delete. Background-work evidence is retained for ten minutes, so deletion may
+be refused until that evidence expires.
 
 ## Distribution
 
